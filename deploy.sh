@@ -136,60 +136,11 @@ collect_parameters() {
 }
 
 ###############################################################################
-# CLONE REPOSITORY
-###############################################################################
-
-clone_repository() {
-    log_info "=== Stage 2: Cloning Repository ==="
-    
-    local auth_url=$(echo "$GIT_REPO_URL" | sed "s|https://|https://${GIT_PAT}@|")
-    
-    if [ -d "$PROJECT_NAME" ]; then
-        log_warning "Directory $PROJECT_NAME already exists. Pulling latest changes..."
-        cd "$PROJECT_NAME"
-        git pull origin "$GIT_BRANCH" || {
-            log_error "Failed to pull latest changes"
-            exit 1
-        }
-    else
-        log_info "Cloning repository..."
-        git clone -b "$GIT_BRANCH" "$auth_url" "$PROJECT_NAME" || {
-            log_error "Failed to clone repository"
-            exit 1
-        }
-        cd "$PROJECT_NAME"
-    fi
-    
-    log_success "Repository ready at: $(pwd)"
-}
-
-###############################################################################
-# VERIFY DOCKERFILE EXISTS
-###############################################################################
-
-verify_docker_files() {
-    log_info "=== Stage 3: Verifying Docker Configuration ==="
-    
-    if [ -f "Dockerfile" ]; then
-        log_success "Found Dockerfile"
-        DEPLOYMENT_TYPE="dockerfile"
-    elif [ -f "docker-compose.yml" ] || [ -f "docker-compose.yaml" ]; then
-        log_success "Found docker-compose.yml"
-        DEPLOYMENT_TYPE="compose"
-    else
-        log_error "No Dockerfile or docker-compose.yml found!"
-        exit 1
-    fi
-    
-    log_info "Deployment type: $DEPLOYMENT_TYPE"
-}
-
-###############################################################################
 # TEST SSH CONNECTION
 ###############################################################################
 
 test_ssh_connection() {
-    log_info "=== Stage 4: Testing SSH Connection ==="
+    log_info "=== Stage 2: Testing SSH Connection ==="
     
     ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
         "$SSH_USER@$SSH_HOST" "echo 'SSH connection successful'" || {
@@ -205,7 +156,7 @@ test_ssh_connection() {
 ###############################################################################
 
 prepare_remote_environment() {
-    log_info "=== Stage 5: Preparing Remote Environment ==="
+    log_info "=== Stage 3: Preparing Remote Environment ==="
     
     ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" 'bash -s' << 'ENDSSH'
         set -e
@@ -245,27 +196,68 @@ ENDSSH
 }
 
 ###############################################################################
-# TRANSFER FILES TO REMOTE SERVER
+# CLONE REPOSITORY ON REMOTE SERVER
 ###############################################################################
 
-transfer_files() {
-    log_info "=== Stage 6: Transferring Files ==="
+clone_repository_remote() {
+    log_info "=== Stage 4: Cloning Repository on Remote Server ==="
     
-    local remote_dir="/home/$SSH_USER/$PROJECT_NAME"
+    # Create authenticated URL
+    local auth_url=$(echo "$GIT_REPO_URL" | sed "s|https://|https://${GIT_PAT}@|")
     
-    ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" "rm -rf $remote_dir"
+    ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" bash << ENDSSH
+        set -e
+        
+        cd ~
+        
+        if [ -d "$PROJECT_NAME" ]; then
+            echo "[INFO] Directory exists. Pulling latest changes..."
+            cd "$PROJECT_NAME"
+            git pull origin $GIT_BRANCH || {
+                echo "[ERROR] Failed to pull latest changes"
+                exit 1
+            }
+        else
+            echo "[INFO] Cloning repository..."
+            git clone -b $GIT_BRANCH "$auth_url" "$PROJECT_NAME" || {
+                echo "[ERROR] Failed to clone repository"
+                exit 1
+            }
+            cd "$PROJECT_NAME"
+        fi
+        
+        echo "[SUCCESS] Repository ready at: \$(pwd)"
+ENDSSH
     
-    log_info "Transferring files via rsync..."
-    rsync -avz --progress -e "ssh -i $SSH_KEY" \
-        --exclude '.git' \
-        --exclude 'node_modules' \
-        --exclude 'logs' \
-        ./ "$SSH_USER@$SSH_HOST:$remote_dir/" || {
-        log_error "File transfer failed"
+    log_success "Repository cloned on remote server"
+}
+
+###############################################################################
+# VERIFY DOCKERFILE EXISTS ON REMOTE
+###############################################################################
+
+verify_docker_files() {
+    log_info "=== Stage 5: Verifying Docker Configuration ==="
+    
+    DEPLOYMENT_TYPE=$(ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" bash << ENDSSH
+        cd ~/$PROJECT_NAME
+        
+        if [ -f "Dockerfile" ]; then
+            echo "dockerfile"
+        elif [ -f "docker-compose.yml" ] || [ -f "docker-compose.yaml" ]; then
+            echo "compose"
+        else
+            echo "none"
+        fi
+ENDSSH
+    )
+    
+    if [ "$DEPLOYMENT_TYPE" = "none" ]; then
+        log_error "No Dockerfile or docker-compose.yml found in repository!"
         exit 1
-    }
+    fi
     
-    log_success "Files transferred to $remote_dir"
+    log_success "Found deployment type: $DEPLOYMENT_TYPE"
 }
 
 ###############################################################################
@@ -273,27 +265,25 @@ transfer_files() {
 ###############################################################################
 
 deploy_application() {
-    log_info "=== Stage 7: Deploying Docker Application ==="
+    log_info "=== Stage 6: Deploying Docker Application ==="
     
-    local remote_dir="/home/$SSH_USER/$PROJECT_NAME"
-    
-    ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" bash -s << ENDSSH
+    ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" bash << ENDSSH
         set -e
-        cd $remote_dir
+        cd ~/$PROJECT_NAME
         
         echo "[INFO] Stopping existing containers..."
-        docker-compose down 2>/dev/null || docker stop $PROJECT_NAME 2>/dev/null || true
-        docker rm $PROJECT_NAME 2>/dev/null || true
+        sudo docker-compose down 2>/dev/null || sudo docker stop $PROJECT_NAME 2>/dev/null || true
+        sudo docker rm $PROJECT_NAME 2>/dev/null || true
         
         if [ "$DEPLOYMENT_TYPE" = "compose" ]; then
             echo "[INFO] Deploying with docker-compose..."
-            docker-compose up -d --build
+            sudo docker-compose up -d --build
         else
             echo "[INFO] Building Docker image..."
-            docker build -t $PROJECT_NAME:latest .
+            sudo docker build -t $PROJECT_NAME:latest .
             
             echo "[INFO] Running container..."
-            docker run -d \
+            sudo docker run -d \
                 --name $PROJECT_NAME \
                 --restart unless-stopped \
                 -p $APP_PORT:$APP_PORT \
@@ -303,12 +293,12 @@ deploy_application() {
         echo "[INFO] Waiting for container to be healthy..."
         sleep 5
         
-        if docker ps | grep -q $PROJECT_NAME; then
+        if sudo docker ps | grep -q $PROJECT_NAME; then
             echo "[SUCCESS] Container is running"
-            docker ps --filter name=$PROJECT_NAME
+            sudo docker ps --filter name=$PROJECT_NAME
         else
             echo "[ERROR] Container failed to start"
-            docker logs $PROJECT_NAME
+            sudo docker logs $PROJECT_NAME 2>&1 || true
             exit 1
         fi
 ENDSSH
@@ -321,12 +311,12 @@ ENDSSH
 ###############################################################################
 
 configure_nginx() {
-    log_info "=== Stage 8: Configuring Nginx Reverse Proxy ==="
+    log_info "=== Stage 7: Configuring Nginx Reverse Proxy ==="
     
-    ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" bash -s << ENDSSH
+    ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" bash << ENDSSH
         set -e
         
-        sudo tee /etc/nginx/sites-available/$PROJECT_NAME > /dev/null << 'EOF'
+        sudo tee /etc/nginx/sites-available/$PROJECT_NAME > /dev/null << 'NGINXCONF'
 server {
     listen 80;
     server_name _;
@@ -343,7 +333,7 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
-EOF
+NGINXCONF
         
         sudo ln -sf /etc/nginx/sites-available/$PROJECT_NAME /etc/nginx/sites-enabled/
         sudo rm -f /etc/nginx/sites-enabled/default
@@ -362,9 +352,9 @@ ENDSSH
 ###############################################################################
 
 validate_deployment() {
-    log_info "=== Stage 9: Validating Deployment ==="
+    log_info "=== Stage 8: Validating Deployment ==="
     
-    ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" bash -s << ENDSSH
+    ssh -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" bash << ENDSSH
         set -e
         
         echo "[INFO] Testing local access..."
@@ -376,7 +366,7 @@ validate_deployment() {
         fi
         
         echo "[INFO] Checking Docker status..."
-        docker ps --filter name=$PROJECT_NAME --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+        sudo docker ps --filter name=$PROJECT_NAME --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
         
         echo "[INFO] Checking Nginx status..."
         sudo systemctl status nginx --no-pager | head -n 5
@@ -405,11 +395,10 @@ main() {
     echo
     
     collect_parameters
-    clone_repository
-    verify_docker_files
     test_ssh_connection
     prepare_remote_environment
-    transfer_files
+    clone_repository_remote
+    verify_docker_files
     deploy_application
     configure_nginx
     validate_deployment
